@@ -1,0 +1,27 @@
+name: Ubuntu-CI
+
+'on':
+  - push
+  - pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: ubuntu-gcc
+    runs-on: ubuntu-latest
+
+    env:
+      CC: gcc
+      CXX: g++
+
+    steps: 
+      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v4.1.0
+      - name: Build and Test
+        run: |
+          mkdir build
+          cd build
+          cmake -DCMAKE_CXX_FLAGS=-fno-exceptions -DROARING_EXCEPTIONS=OFF ..
+          cmake --build . 
+          ctest . --output-on-failure

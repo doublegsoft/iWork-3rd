@@ -1,0 +1,66 @@
+#!/bin/sh
+
+#
+# Run this bootstrap script to 
+# create the configure script and Makefile.in files etc.
+#
+# You need to do this if you have just done 'cvs co log4c'.
+#
+# We require:
+# autoconf 2.57+
+# automake 1.7+ (recommended is 1.9+)
+# libtool 1.4+
+# m4 1.4+
+# perl 5.8+
+#
+# Note that on vanilla RHEL3 you need to build on a local disk--
+# some interaction of 'cp -p' with NFS.  Fixed in RHEL4.
+#
+# Once the configure script is there you 
+# can do something like "configure --enable-test"
+# to create the Makefiles.  It is generarelly better if you 
+# do that outside the source tree...something like this:
+#
+# cvs co log4c
+# cd log4c; ./bootstrap
+# cd ..;
+# mkdir fc5; cd fc5
+# ../log4c/configure --enable-test --enable-debug --enable-doc
+# make
+# 
+
+# Need at least automake 1.7 
+am_major=`automake --version | grep automake | cut -d " " -f 4 | cut -d "." -f 1`
+am_minor=`automake --version | grep automake | cut -d " " -f 4 | cut -d "." -f 2`
+digitver=`expr $am_major \* 10`
+digitver=`expr $digitver + $am_minor`
+if [ $digitver -lt 17 ]; then
+	echo "Need at least automake 1.7--found $am_major.$am_minor"
+	exit 1
+fi
+
+# If it's 1.9 or later take advantage of the force option
+ac_major=`aclocal --version | grep aclocal | cut -d " " -f 4 | cut -d "." -f 1`
+ac_minor=`aclocal --version | grep aclocal | cut -d " " -f 4 | cut -d "." -f 2`
+digitver=`expr $ac_major \* 10`
+digitver=`expr $digitver + $ac_minor`
+if [ $digitver -ge 19 ]; then
+	ACLOCAL_FLAGS="$ACLOCAL_FLAGS --force"
+fi
+
+set -x
+
+if uname -a | egrep -i 'darwin'; then
+	glibtoolize --force --automake --copy
+else
+    libtoolize --force --automake --copy
+fi
+
+aclocal -I config $ACLOCAL_FLAGS
+autoheader --force
+automake --add-missing --copy
+autoconf --force
+#
+# "You can run the configure script now to build your Makefiles."
+#
+
