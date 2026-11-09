@@ -1,0 +1,124 @@
+name: ci
+
+on:
+  push:
+    branches: [master]   # PR branches run via pull_request; avoids double runs
+  pull_request:
+  schedule:
+    - cron: "20 3 * * *"   # tier 2 nightly
+  workflow_dispatch:
+
+# A new push to a branch cancels its still-running CI for the previous commit.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Tier 1: no model assets — build matrix, fast tests, generated-file checks.
+  fast:
+    strategy:
+      matrix:
+        include:
+          # gcc-release builds the shipped CPU config: every ggml-cpu ISA variant
+          # (GGML_CPU_ALL_VARIANTS), runtime-dispatched -- so released binaries get
+          # AVX-512 without -march=native (which Nix strips and which mis-targets
+          # cross-host builds).
+          - { name: gcc-release, preset: release-portable, cc: gcc, cxx: g++ }
+          - { name: clang-debug-san, preset: debug, cc: clang, cxx: clang++ }
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          # unicodedata is bundled with CPython and its UCD version is fixed per
+          # minor release; the generated table is only reproducible on a matching
+          # version. 3.13 -> UCD 15.1.0, matching src/unicode_data.inc (the runner
+          # default python3 is 3.12 -> UCD 15.0.0, which regenerates differently).
+          python-version: '3.13'
+      - name: configure
+        run: cmake --preset ${{ matrix.preset }} -DGGML_NATIVE=OFF
+        env: { CC: '${{ matrix.cc }}', CXX: '${{ matrix.cxx }}' }
+      - name: build
+        # -j4 (not unbounded -j): release-portable compiles 14 ggml-cpu ISA
+        # variants; uncapped parallelism OOMs the 16 GB runner.
+        run: cmake --build --preset ${{ matrix.preset }} -j4
+      - name: test (model-independent)
+        run: ctest --preset ${{ matrix.preset }} -LE model
+      - name: unicode table regen check
+        run: |
+          python3 scripts/gen_unicode.py > /tmp/unicode_data.inc
+          diff -u src/unicode_data.inc /tmp/unicode_data.inc
+      - name: assert SIMD compiled in (guard the SSE-only trap)
+        if: matrix.name == 'gcc-release'
+        # The AVX-512 ISA variant must actually contain AVX-512 -- catches a
+        # silent regression to a SIMD-less build (e.g. a stripped -march).
+        run: |
+          so=build/release-portable/bin/libggml-cpu-skylakex.so
+          n=$(objdump -d "$so" | grep -c '%zmm')
+          echo "skylakex %zmm instructions: $n"
+          test "$n" -gt 0
+
+  # Tier 2 (nightly / dispatch): HF reference fixtures + parity + fuzz smoke.
+  # Needs the model checkpoint; cached between runs.
+  parity:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: cache model + fixtures
+        id: cache
+        uses: actions/cache@v4
+        with:
+          # HF safetensors download + reference fixtures only. The GGUF is
+          # (re)converted from these on every run, so it always reflects the
+          # current scripts/convert.py rather than a stale cached artifact.
+          path: |
+            ~/models/privacy-filter-multilingual
+            tests/fixtures/hf
+          key: pf-model-fixtures-v1
+      - name: python env
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          .venv/bin/pip install -q -r scripts/requirements.txt
+      - name: fetch model + dump fixtures
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          .venv/bin/pip install -q "huggingface_hub[cli]"
+          .venv/bin/hf download OpenMed/privacy-filter-multilingual \
+            --local-dir ~/models/privacy-filter-multilingual
+          .venv/bin/python scripts/hf_dump.py \
+            --model ~/models/privacy-filter-multilingual --out tests/fixtures/hf
+      - name: convert HF -> GGUF
+        run: |
+          # Conversion is part of the tested path: the parity suite below gates
+          # these freshly converted GGUFs against the HF reference fixtures, so a
+          # scripts/convert.py regression fails CI. ~/ggufs is deliberately
+          # outside the cached paths so every run reconverts with the current
+          # script. (The f16 is the shipped artifact, published at
+          # huggingface.co/LocalAI-io; the f32 adds the tight exact-rotation
+          # parity gate, cos >= 0.99999, that isolates conversion errors from
+          # f16 rounding.)
+          mkdir -p ~/ggufs
+          .venv/bin/python scripts/convert.py \
+            --model ~/models/privacy-filter-multilingual \
+            --outfile ~/ggufs/pf-rope2-f16.gguf --outtype f16
+          .venv/bin/python scripts/convert.py \
+            --model ~/models/privacy-filter-multilingual \
+            --outfile ~/ggufs/pf-f32.gguf --outtype f32
+      - name: build
+        run: cmake --preset release-portable && cmake --build --preset release-portable -j4
+      - name: parity suite
+        run: PF_GGUF_DIR=~/ggufs ctest --preset release-portable -L model
+      - name: fuzz smoke (5 min/target)
+        run: |
+          cmake --preset fuzz && cmake --build --preset fuzz -j --target fuzz_tokenizer fuzz_gguf
+          PF_GGUF=~/ggufs/pf-rope2-f16.gguf \
+            ./build/fuzz/fuzz_tokenizer -max_total_time=300 -max_len=4096
+          ./build/fuzz/fuzz_gguf -max_total_time=300 -max_len=8192
